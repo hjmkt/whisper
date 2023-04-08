@@ -6,6 +6,7 @@ import ffmpeg
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch import Tensor, nn
 
 from .utils import exact_div
 
@@ -21,6 +22,114 @@ N_FRAMES = exact_div(N_SAMPLES, HOP_LENGTH)  # 3000 frames in a mel spectrogram 
 N_SAMPLES_PER_TOKEN = HOP_LENGTH * 2  # the initial convolutions has stride 2
 FRAMES_PER_SECOND = exact_div(SAMPLE_RATE, HOP_LENGTH)  # 10ms per audio frame
 TOKENS_PER_SECOND = exact_div(SAMPLE_RATE, N_SAMPLES_PER_TOKEN)  # 20ms per audio token
+
+
+import librosa
+
+
+class STFT(torch.nn.Module):
+    def __init__(self, n_fft, hop_length, window_periodic=True, stft_mode=None):
+        super().__init__()
+        self.win_length = n_fft
+        self.hop_length = hop_length
+        # self.nfft = 2 ** math.ceil(math.log2(self.win_length))
+        self.nfft = n_fft
+        self.freq_cutoff = self.nfft // 2 + 1
+        self.register_buffer(
+            "window",
+            torch.hann_window(self.win_length, periodic=window_periodic).float(),
+        )
+        if stft_mode == "conv":
+            fourier_basis = torch.fft.fft(torch.eye(self.nfft))
+            # print("rfft", fourier_basis.shape)
+            fourier_basis = torch.view_as_real(fourier_basis)
+            # print("first", fourier_basis.shape)
+            # fourier_basis = torch.stack(
+            # (fourier_basis[..., 0], fourier_basis[..., 1]), dim=-1
+            # )
+            # print("conv", self.freq_cutoff, fourier_basis.shape)
+            forward_basis = (
+                # fourier_basis
+                fourier_basis[: self.freq_cutoff]
+                .permute(2, 0, 1)
+                .reshape(-1, 1, fourier_basis.shape[1])
+            )
+            # print("window", self.window.shape)
+            # print("m", forward_basis.shape)
+            # print("pad", librosa.util.pad_center(self.window, size=self.nfft).shape)
+            forward_basis = forward_basis * torch.as_tensor(
+                librosa.util.pad_center(self.window, size=self.nfft),
+                dtype=forward_basis.dtype,
+            )
+            # print("conv1d", forward_basis.shape)
+            self.stft = (
+                torch.nn.Conv1d(
+                    forward_basis.shape[1],
+                    forward_basis.shape[0],
+                    forward_basis.shape[2],
+                    bias=False,
+                    stride=self.hop_length,
+                )
+                # .cuda()
+                .requires_grad_(False)
+            )
+            self.stft.weight.copy_(forward_basis)
+        else:
+            self.stft = None
+
+    def forward(self, signal):
+        pad = self.freq_cutoff - 1
+        signal = torch.unsqueeze(signal, 0)
+        padded_signal = torch.nn.functional.pad(
+            signal.unsqueeze(1), (pad, pad), mode="reflect"
+        ).squeeze(1)
+        real, imag = (
+            self.stft(padded_signal.unsqueeze(dim=1)).split(self.freq_cutoff, dim=1)
+            if self.stft is not None
+            else padded_signal.stft(
+                self.nfft,
+                hop_length=self.hop_length,
+                win_length=self.win_length,
+                window=self.window,
+                center=False,
+            ).unbind(dim=-1)
+        )
+        # print("real", real.shape)
+        # print("imag", imag.shape)
+        # return real, imag
+        return real, imag
+
+
+class LogMelSpectrogram(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.stft = STFT(N_FFT, HOP_LENGTH, window_periodic=True, stft_mode="conv")
+
+    def forward(self, x: Tensor) -> Tensor:
+        audio = x
+        n_mels = N_MELS
+        padding = 0
+        if not torch.is_tensor(audio):
+            audio = torch.from_numpy(audio)
+
+        # print("old", audio.shape)
+        # audio = torch.unsqueeze(audio, 0)
+        if padding > 0:
+            audio = F.pad(audio, (0, padding))
+        # print("new padded", audio.shape)
+        # stft = self.stft(audio)
+        stft_real, stft_imag = self.stft(audio)
+        # print("new stft", stft.shape)
+        # magnitudes = stft[..., :-1].abs() ** 2
+        magnitudes = (stft_real[..., :-1] ** 2 + stft_imag[..., :-1] ** 2)[0]
+
+        filters = mel_filters(audio.device, n_mels)
+        mel_spec = filters @ magnitudes
+
+        log_spec = torch.clamp(mel_spec, min=1e-10).log10()
+        log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
+        log_spec = (log_spec + 4.0) / 4.0
+        return log_spec
 
 
 def load_audio(file: str, sr: int = SAMPLE_RATE):
@@ -103,6 +212,7 @@ def log_mel_spectrogram(
     padding: int = 0,
     device: Optional[Union[str, torch.device]] = None,
 ):
+    return LogMelSpectrogram()(audio)
     """
     Compute the log-Mel spectrogram of
 
@@ -135,8 +245,17 @@ def log_mel_spectrogram(
     if padding > 0:
         audio = F.pad(audio, (0, padding))
     window = torch.hann_window(N_FFT).to(audio.device)
+    # print("pre padded", audio.shape)
     stft = torch.stft(audio, N_FFT, HOP_LENGTH, window=window, return_complex=True)
+    stft_real, stft_imag = STFT(
+        N_FFT, HOP_LENGTH, window_periodic=True, stft_mode="conv"
+    )(audio)
+    # print("stft", stft.shape, stft)
+    # print("new stft real", stft_real)
+    # print("new stft imag", stft_imag)
     magnitudes = stft[..., :-1].abs() ** 2
+    magnitudes = (stft_real[..., :-1] ** 2 + stft_imag[..., :-1] ** 2)[0]
+    # print(magnitudes, new_magnitudes)
 
     filters = mel_filters(audio.device, n_mels)
     mel_spec = filters @ magnitudes

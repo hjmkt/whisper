@@ -6,6 +6,7 @@ from functools import cached_property, lru_cache
 from typing import Dict, List, Optional, Tuple
 
 import tiktoken
+from tiktoken_ext.openai_public import gpt2
 
 LANGUAGES = {
     "en": "english",
@@ -139,7 +140,13 @@ class Tokenizer:
     def __post_init__(self):
         for special in self.encoding.special_tokens_set:
             special_token = self.encoding.encode_single_token(special)
+            # print(special, special_token)
             self.special_tokens[special] = special_token
+        # with open("special_tokens.js", "w") as f:
+        # print(
+        # f"export let special_tokens = {self.special_tokens};",
+        # file=f,
+        # )
 
         sot: int = self.special_tokens["<|startoftranscript|>"]
         translate: int = self.special_tokens["<|translate|>"]
@@ -171,6 +178,7 @@ class Tokenizer:
 
     @cached_property
     def eot(self) -> int:
+        print("eot", self.encoding.eot_token)
         return self.encoding.eot_token
 
     @cached_property
@@ -266,7 +274,10 @@ class Tokenizer:
                 if len(tokens) == 1 or symbol in miscellaneous:
                     result.add(tokens[0])
 
-        return tuple(sorted(result))
+        tokens = tuple(sorted(result))
+        # with open("non_speech_tokens.js", "w") as f:
+        # print("export let non_speech_tokens =", tokens, ";", file=f)
+        return tokens
 
     def split_to_word_tokens(self, tokens: List[int]):
         if self.language in {"zh", "ja", "th", "lo", "my"}:
@@ -351,7 +362,7 @@ def get_encoding(name: str = "gpt2"):
     return tiktoken.Encoding(
         name=os.path.basename(vocab_path),
         explicit_n_vocab=n_vocab,
-        pat_str=r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""",
+        pat_str=gpt2()["pat_str"],
         mergeable_ranks=ranks,
         special_tokens=special_tokens,
     )
