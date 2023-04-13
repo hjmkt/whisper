@@ -7,6 +7,8 @@ import numpy as np
 from whisper.model import AudioEncoderWrapper
 from torch import Tensor, nn
 import torch.nn.functional as F
+import onnx
+import onnx_graphsurgeon as gs
 
 SAMPLE_RATE = 16000
 N_FFT = 400
@@ -43,14 +45,17 @@ class STFT(torch.nn.Module):
         )
 
         forward_basis = forward_basis.reshape(
-            forward_basis.shape[0], forward_basis.shape[1], 1, forward_basis.shape[2]
+            forward_basis.shape[0],
+            forward_basis.shape[1],
+            1,
+            forward_basis.shape[2],
         )
         # Simulate Conv1d by using Conv2d as a workaround for ONNX's limited layer support
         self.stft = (
             torch.nn.Conv2d(
                 forward_basis.shape[1],
                 forward_basis.shape[0],
-                forward_basis.shape[2:],
+                forward_basis.shape[2:4],
                 bias=False,
                 stride=(1, self.hop_length),
             )
@@ -130,7 +135,6 @@ def convert(
     output_dir="models",
     mel_filters_path="mel_filters.npz",
     model_type="base",
-    target="wasm",
     opset_version=17,
 ):
     if not os.path.exists(output_dir):
@@ -210,6 +214,7 @@ def convert(
         verbose=True,
         input_names=["input"],
         output_names=["output"],
+        do_constant_folding=True,
         opset_version=opset_version,
     )
     torch.onnx.export(
@@ -250,7 +255,7 @@ def convert(
             "cross_value_cache": [1],
             "positional_embedding": [0],
         },
-        opset_version=17,
+        opset_version=16,
     )
 
 
@@ -261,7 +266,6 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, default="models")
     parser.add_argument("--mel_filters_path", type=str)
     parser.add_argument("--model_type", type=str, default="base")
-    parser.add_argument("--target", type=str, default="wasm")
     parser.add_argument("--opset_version", type=int, default=17)
     args = parser.parse_args()
     convert(**vars(args))
