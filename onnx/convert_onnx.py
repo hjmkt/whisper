@@ -1,25 +1,26 @@
 import torch
 import whisper
 import librosa
+import gzip
 import os
+import sys
 import argparse
 import numpy as np
 from whisper.model import AudioEncoderWrapper
 from torch import Tensor, nn
 import torch.nn.functional as F
-import onnx
-import onnx_graphsurgeon as gs
+from onnxruntime.quantization import quantize_dynamic, QuantType
 
 SAMPLE_RATE = 16000
 N_FFT = 400
 N_MELS = 80
 HOP_LENGTH = 160
-CHUNK_LENGTH = 30
 
 
 class STFT(torch.nn.Module):
     """
-    Simulate torch.stft by using a convolution layer as a workaround for ONNX's limited layer support
+    Simulate torch.stft by using a convolution layer
+    as a workaround for ONNX's limited layer support
     """
 
     def __init__(self, n_fft, hop_length, window_periodic=True):
@@ -50,6 +51,8 @@ class STFT(torch.nn.Module):
             1,
             forward_basis.shape[2],
         )
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
         # Simulate Conv1d by using Conv2d as a workaround for ONNX's limited layer support
         self.stft = (
             torch.nn.Conv2d(
@@ -59,7 +62,7 @@ class STFT(torch.nn.Module):
                 bias=False,
                 stride=(1, self.hop_length),
             )
-            .cuda()
+            .to(device)
             .requires_grad_(False)
         )
         self.stft.weight.copy_(forward_basis)
@@ -69,9 +72,12 @@ class STFT(torch.nn.Module):
         signal = torch.unsqueeze(signal, 0).unsqueeze(1)
 
         # padded_signal = torch.nn.functional.pad(signal, (pad, pad), mode="reflect").squeeze(1)
-        # Simulate the above padding by concatenating zero tensors as a workaround for ONNX's limited layer support
-        # The simulated padding mode is "constant" instead of "reflect", which doesn't much affect the result
-        pad_zeros = torch.zeros(signal.shape[0], signal.shape[1], pad).cuda()
+        # Simulate the above padding by concatenating zero tensors
+        # as a workaround for ONNX's limited layer support
+        # The simulated padding mode is "constant" instead of "reflect",
+        # which doesn't much affect the result
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        pad_zeros = torch.zeros(signal.shape[0], signal.shape[1], pad).to(device)
         padded_signal = torch.cat((pad_zeros, signal, pad_zeros), dim=2)
 
         stft_signal = self.stft(padded_signal.unsqueeze(dim=1))
@@ -125,7 +131,7 @@ class LogMelSpectrogram(nn.Module):
         filters = mel_filters(self.mel_filters_path, audio.device, n_mels)
         mel_spec = filters @ magnitudes
 
-        log_spec = relu_max(mel_spec, torch.tensor(1e-10)).log10()
+        log_spec = relu_max(mel_spec, 1e-10).log10()
         log_spec = relu_max(log_spec, log_spec.max() - 8.0)
         log_spec = (log_spec + 4.0) / 4.0
         return log_spec
@@ -136,24 +142,25 @@ def convert(
     mel_filters_path="mel_filters.npz",
     model_type="base",
     opset_version=17,
+    chunk_length=30,
 ):
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
-    model = whisper.load_model(model_type)
+    model = whisper.load_model(model_type, chunk_length=chunk_length)
     model.encoder = AudioEncoderWrapper(model.encoder, model.decoder)
     preprocessor = LogMelSpectrogram(mel_filters_path)
 
-    # positional_embedding = model.decoder.positional_embedding.cpu().detach().numpy()
-    # print(positional_embedding, positional_embedding.shape)
-    # with open("positional_embedding.js", "w") as f:
-    # print(
-    # "export let positional_embedding =",
-    # list([list(p) for p in positional_embedding]),
-    # ";",
-    # file=f,
-    # )
-    # exit()
+    positional_embedding = model.decoder.positional_embedding.cpu().detach().numpy()
+    print("pe shape", positional_embedding.shape, positional_embedding.dtype)
+    with gzip.open(f"{output_dir}/positional_embedding.bin.gz", "wb") as f:
+        f.write(positional_embedding.tobytes())
+        # print(
+        # "export let positional_embedding =",
+        # list([list(p) for p in positional_embedding]),
+        # ";",
+        # file=f,
+        # )
 
     def convert_long_to_int(model):
         for name, param in model.named_parameters():
@@ -180,38 +187,53 @@ def convert(
     for p in preprocessor.parameters():
         p.requires_grad = False
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
     dummy_input_encoder = torch.randn(
-        1, 80, 3000, dtype=torch.float32, device="cuda", requires_grad=False
+        1,
+        80,
+        chunk_length * 100,
+        dtype=torch.float32,
+        device=device,
+        requires_grad=False,
     )
     dummy_input_decoder_token = (
-        (torch.randn(1, 1, requires_grad=False) * 10).int().to("cuda")
+        (torch.randn(1, 1, requires_grad=False) * 10).int().to(device)
     )
     dummy_input_decoder_self_key_cache = torch.randn(
         len(model.decoder.blocks), 1, 512, dtype=torch.float32, requires_grad=False
-    ).to("cuda")
+    ).to(device)
     dummy_input_decoder_self_value_cache = torch.randn(
         len(model.decoder.blocks), 1, 512, dtype=torch.float32, requires_grad=False
-    ).to("cuda")
+    ).to(device)
     dummy_input_decoder_cross_key_cache = torch.randn(
-        len(model.decoder.blocks), 1500, 512, dtype=torch.float32, requires_grad=False
-    ).to("cuda")
-    dummy_input_decoder_cross_value_cache = torch.randn(
-        len(model.decoder.blocks), 1500, 512, dtype=torch.float32, requires_grad=False
-    ).to("cuda")
-    dummy_input_decoder_positional_embedding = torch.randn(
-        1, 512, dtype=torch.float32, requires_grad=False
-    ).to("cuda")
-    dummy_input_preprocessor = torch.randn(
-        SAMPLE_RATE * CHUNK_LENGTH,
+        len(model.decoder.blocks),
+        chunk_length * 50,
+        512,
         dtype=torch.float32,
         requires_grad=False,
-    ).to("cuda")
+    ).to(device)
+    dummy_input_decoder_cross_value_cache = torch.randn(
+        len(model.decoder.blocks),
+        chunk_length * 50,
+        512,
+        dtype=torch.float32,
+        requires_grad=False,
+    ).to(device)
+    dummy_input_decoder_positional_embedding = torch.randn(
+        1, 512, dtype=torch.float32, requires_grad=False
+    ).to(device)
+    dummy_input_preprocessor = torch.randn(
+        SAMPLE_RATE * chunk_length,
+        dtype=torch.float32,
+        requires_grad=False,
+    ).to(device)
 
     torch.onnx.export(
         preprocessor,
         dummy_input_preprocessor,
-        f"{output_dir}/preprocessor.onnx",
-        verbose=True,
+        f"{output_dir}/preprocessor_{chunk_length}s_float32.onnx",
+        # verbose=True,
         input_names=["input"],
         output_names=["output"],
         do_constant_folding=True,
@@ -220,8 +242,7 @@ def convert(
     torch.onnx.export(
         model.encoder,
         dummy_input_encoder,
-        f"{output_dir}/encoder.onnx",
-        verbose=True,
+        f"{output_dir}/encoder_{chunk_length}s_float32.onnx",
         input_names=["input"],
         output_names=["output", "key_cache", "value_cache"],
         opset_version=opset_version,
@@ -236,8 +257,7 @@ def convert(
             dummy_input_decoder_cross_value_cache,
             dummy_input_decoder_positional_embedding,
         ),
-        f=f"{output_dir}/decoder.onnx",
-        verbose=True,
+        f=f"{output_dir}/decoder_{chunk_length}s_float32.onnx",
         input_names=[
             "input_token",
             "self_key_cache",
@@ -257,6 +277,38 @@ def convert(
         },
         opset_version=16,
     )
+    print("Quantizing preprocessor...", file=sys.stderr)
+    quantize_dynamic(
+        f"{output_dir}/preprocessor_{chunk_length}s_float32.onnx",
+        f"{output_dir}/preprocessor_{chunk_length}s_int8.onnx",
+        weight_type=QuantType.QUInt8,
+    )
+    print("Quantizing encoder...", file=sys.stderr)
+    quantize_dynamic(
+        f"{output_dir}/encoder_{chunk_length}s_float32.onnx",
+        f"{output_dir}/encoder_{chunk_length}s_int8.onnx",
+        weight_type=QuantType.QUInt8,
+    )
+    print("Quantizing decoder...", file=sys.stderr)
+    quantize_dynamic(
+        f"{output_dir}/decoder_{chunk_length}s_float32.onnx",
+        f"{output_dir}/decoder_{chunk_length}s_int8.onnx",
+        weight_type=QuantType.QUInt8,
+    )
+
+    def gzip_onnx(onnx_file):
+        print(f"GZIP-compressing {onnx_file}...", file=sys.stderr)
+        with open(onnx_file, "rb") as f:
+            data = f.read()
+            with gzip.open(f"{onnx_file}.gz", "wb") as f:
+                f.write(data)
+
+    gzip_onnx(f"{output_dir}/preprocessor_{chunk_length}s_float32.onnx")
+    gzip_onnx(f"{output_dir}/encoder_{chunk_length}s_float32.onnx")
+    gzip_onnx(f"{output_dir}/decoder_{chunk_length}s_float32.onnx")
+    gzip_onnx(f"{output_dir}/preprocessor_{chunk_length}s_int8.onnx")
+    gzip_onnx(f"{output_dir}/encoder_{chunk_length}s_int8.onnx")
+    gzip_onnx(f"{output_dir}/decoder_{chunk_length}s_int8.onnx")
 
 
 if __name__ == "__main__":
@@ -267,5 +319,6 @@ if __name__ == "__main__":
     parser.add_argument("--mel_filters_path", type=str)
     parser.add_argument("--model_type", type=str, default="base")
     parser.add_argument("--opset_version", type=int, default=17)
+    parser.add_argument("--chunk_length", type=int, default=30)
     args = parser.parse_args()
     convert(**vars(args))

@@ -2,45 +2,44 @@ import onnx
 import torch
 import numpy as np
 import whisper
+import argparse
 import onnxruntime as ort
 from whisper.tokenizer import get_tokenizer
 
+SAMPLE_RATE = 16000
+
 
 class WhisperWrapper:
-    def __init__(self, dims, n_blocks, positional_embedding):
+    def __init__(self, dims, n_blocks, positional_embedding, chunk_length):
         sess_options = ort.SessionOptions()
         # sess_options.graph_optimization_level = (
         # ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         # )
         self.ort_session_encoder = ort.InferenceSession(
-            "encoder.onnx",
+            "models/encoder_float32.onnx",
             sess_options,
-            providers=[
-                "CUDAExecutionProvider",
-                "CPUExecutionProvider",
-            ],
+            providers=["CPUExecutionProvider"],
         )
         self.ort_session_decoder = ort.InferenceSession(
-            "decoder.onnx",
+            "models/decoder_float32.onnx",
             sess_options,
-            providers=[
-                "CUDAExecutionProvider",
-                "CPUExecutionProvider",
-            ],
+            providers=["CPUExecutionProvider"],
         )
         self.ort_session_preprocessor = ort.InferenceSession(
-            "preprocessor.onnx",
+            "models/preprocessor_float32.onnx",
             sess_options,
-            providers=[
-                "CUDAExecutionProvider",
-                "CPUExecutionProvider",
-            ],
+            providers=["CPUExecutionProvider"],
         )
         self.dims = dims
-        self.self_attn_key_cache = torch.zeros(n_blocks, 1, 512).to("cuda")
-        self.self_attn_value_cache = torch.zeros(n_blocks, 1, 512).to("cuda")
-        self.cross_attn_key_cache = torch.zeros(n_blocks, 1500, 512).to("cuda")
-        self.cross_attn_value_cache = torch.zeros(n_blocks, 1500, 512).to("cuda")
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.self_attn_key_cache = torch.zeros(n_blocks, 1, 512).to(device)
+        self.self_attn_value_cache = torch.zeros(n_blocks, 1, 512).to(device)
+        self.cross_attn_key_cache = torch.zeros(n_blocks, chunk_length * 50, 512).to(
+            device
+        )
+        self.cross_attn_value_cache = torch.zeros(n_blocks, chunk_length * 50, 512).to(
+            device
+        )
         self.positional_embedding = positional_embedding
 
     def encoder(self, x):
@@ -60,8 +59,6 @@ class WhisperWrapper:
         cross_value_cache,
         positional_embedding,
     ):
-        print(self.cross_attn_value_cache.shape)
-        print("dec input", tokens)
         output = self.ort_session_decoder.run(
             None,
             {
@@ -146,7 +143,6 @@ class WhisperWrapper:
         logits[:, mask] = -np.inf
         language_tokens = logits.argmax(dim=-1)
         language_token_probs = logits.softmax(dim=-1).cpu()
-        print("det soft logits", language_token_probs)
         language_probs = [
             {
                 c: language_token_probs[i, j].item()
@@ -164,16 +160,16 @@ class WhisperWrapper:
         return language_tokens, language_probs
 
 
-def run():
-    torch_model = whisper.load_model("base")
+def run(chunk_length):
+    torch_model = whisper.load_model("base", chunk_length=chunk_length)
     model_dims = torch_model.dims
 
     # print(onnx.helper.printable_graph(model.graph))
     positional_embedding = torch_model.decoder.positional_embedding
-    wrapper = WhisperWrapper(model_dims, 6, positional_embedding)
+    wrapper = WhisperWrapper(model_dims, 6, positional_embedding, chunk_length)
 
     audio = whisper.load_audio("/home/hjmkt/Documents/ja.mp3")
-    audio = whisper.pad_or_trim(audio)
+    audio = whisper.pad_or_trim(audio, chunk_length * SAMPLE_RATE)
 
     mel = wrapper.preprocessor(audio)
 
@@ -181,3 +177,12 @@ def run():
     result = whisper.decode(wrapper, mel, options)
 
     print(result.text)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        prog="ONNX Whisper Test", description="Test ONNX Whisper model"
+    )
+    parser.add_argument("--chunk_length", type=int, default=30)
+    args = parser.parse_args()
+    run(**vars(args))

@@ -19,7 +19,6 @@ if TYPE_CHECKING:
 def detect_language(
     model: "Whisper", mel: Tensor, tokenizer: Tokenizer = None
 ) -> Tuple[Tensor, List[dict]]:
-    print("det lang", mel)
     """
     Detect the spoken language in the audio, and return them as list of strings, along with the ids
     of the most probable language tokens and the probability distribution over all language tokens.
@@ -54,10 +53,8 @@ def detect_language(
 
     # forward pass using a single token, startoftranscript
     n_audio = mel.shape[0]
-    # print("n_audio", n_audio)
     x = torch.tensor([[tokenizer.sot]] * n_audio).to(mel.device)  # [n_audio, 1]
     logits = model.detection_logits(x)[:, 0]
-    print("det logits", logits)
 
     # collect detected languages; suppress all non-language tokens
     mask = torch.ones(logits.shape[-1], dtype=torch.bool)
@@ -65,7 +62,6 @@ def detect_language(
     logits[:, mask] = -np.inf
     language_tokens = logits.argmax(dim=-1)
     language_token_probs = logits.softmax(dim=-1).cpu()
-    print("det soft logits", language_token_probs)
     language_probs = [
         {
             c: language_token_probs[i, j].item()
@@ -78,7 +74,6 @@ def detect_language(
         language_tokens = language_tokens[0]
         language_probs = language_probs[0]
 
-    print("token prob", language_tokens, language_probs)
     return language_tokens, language_probs
 
 
@@ -163,7 +158,6 @@ class PyTorchInference(Inference):
 
         # return self.model.decoder(tokens, audio_features, kv_cache=self.kv_cache)
         offset = self.model.self_attn_value_cache.shape[1] - 1
-        # print("pe", tokens.shape[-1])
         if hasattr(self.model.decoder, "positional_embedding"):
             positional_embedding = self.model.decoder.positional_embedding[
                 offset : offset + tokens.shape[-1]
@@ -172,7 +166,6 @@ class PyTorchInference(Inference):
             positional_embedding = self.model.positional_embedding[
                 offset : offset + tokens.shape[-1]
             ]
-        print("inf logits", positional_embedding.shape, tokens.shape)
         l, new_self_attn_key_cache, new_self_attn_value_cache = self.model.decoder(
             tokens,
             self.model.self_attn_key_cache,
@@ -181,11 +174,8 @@ class PyTorchInference(Inference):
             self.model.cross_attn_value_cache,
             positional_embedding,
         )
-        # print("inf logits", tokens.shape)
-        # print("pre cache", self.model.self_attn_value_cache.shape)
         self.model.self_attn_key_cache = new_self_attn_key_cache
         self.model.self_attn_value_cache = new_self_attn_value_cache
-        # print("post cache", self.model.self_attn_value_cache.shape)
         return l
 
     # def cleanup_caching(self):
@@ -238,7 +228,6 @@ class MaximumLikelihoodRanker(SequenceRanker):
 
         # get the sequence with the highest score
         lengths = [[len(t) for t in s] for s in tokens]
-        print("length", lengths, tokens)
         return [np.argmax(scores(p, l)) for p, l in zip(sum_logprobs, lengths)]
 
 
@@ -302,22 +291,17 @@ class GreedyDecoder(TokenDecoder):
     def __init__(self, temperature: float, eot: int):
         self.temperature = temperature
         self.eot = eot
-        # print("greedy", self.temperature)
 
     def update(
         self, tokens: Tensor, logits: Tensor, sum_logprobs: Tensor
     ) -> Tuple[Tensor, bool]:
-        print("gd update", tokens, logits, sum_logprobs)
         if self.temperature == 0:
             next_tokens = logits.argmax(dim=-1)
         else:
             next_tokens = Categorical(logits=logits / self.temperature).sample()
-        print("next", next_tokens)
 
         logprobs = F.log_softmax(logits.float(), dim=-1)
         current_logprobs = logprobs[torch.arange(logprobs.shape[0]), next_tokens]
-        print("current logprobs", current_logprobs)
-        print("sum logprobs", sum_logprobs)
         sum_logprobs += current_logprobs * (tokens[:, -1] != self.eot)
 
         next_tokens[tokens[:, -1] == self.eot] = self.eot
@@ -346,7 +330,6 @@ class BeamSearchDecoder(TokenDecoder):
         self.patience = patience or 1.0
         self.max_candidates: int = round(beam_size * self.patience)
         self.finished_sequences = None
-        # print("beam")
 
         assert (
             self.max_candidates > 0
@@ -461,7 +444,6 @@ class SuppressBlank(LogitFilter):
         self.sample_begin = sample_begin
 
     def apply(self, logits: Tensor, tokens: Tensor):
-        print("filter blank", logits)
         if tokens.shape[1] == self.sample_begin:
             logits[:, self.tokenizer.encode(" ") + [self.tokenizer.eot]] = -np.inf
 
@@ -471,7 +453,6 @@ class SuppressTokens(LogitFilter):
         self.suppress_tokens = list(suppress_tokens)
 
     def apply(self, logits: Tensor, tokens: Tensor):
-        print("filter tokens", logits)
         logits[:, self.suppress_tokens] = -np.inf
 
 
@@ -487,7 +468,6 @@ class ApplyTimestampRules(LogitFilter):
         self.max_initial_timestamp_index = max_initial_timestamp_index
 
     def apply(self, logits: Tensor, tokens: Tensor):
-        print("filter atr", logits)
         # suppress <|notimestamps|> which is handled by without_timestamps
         if self.tokenizer.no_timestamps is not None:
             logits[:, self.tokenizer.no_timestamps] = -np.inf
@@ -644,7 +624,6 @@ class DecodingTask:
 
     def _get_suppress_tokens(self) -> Tuple[int]:
         suppress_tokens = self.options.suppress_tokens
-        print("get suppress opt", suppress_tokens)
 
         if isinstance(suppress_tokens, str):
             suppress_tokens = [int(t) for t in suppress_tokens.split(",")]
@@ -669,7 +648,6 @@ class DecodingTask:
         if self.tokenizer.no_speech is not None:
             # no-speech probability is collected separately
             suppress_tokens.append(self.tokenizer.no_speech)
-        print("get suppress tokens", suppress_tokens)
 
         return tuple(sorted(set(suppress_tokens)))
 
@@ -687,11 +665,8 @@ class DecodingTask:
             audio_features = self.model.encoder(mel)
             if type(audio_features) is tuple:
                 audio_features, k, v = audio_features
-                # print("_get_audio")
-                # print("pre cache", self.model.self_attn_value_cache.shape)
                 self.model.cross_attn_key_cache = k
                 self.model.cross_attn_value_cache = v
-                # print("post cache", self.model.self_attn_value_cache.shape)
 
         if audio_features.dtype != (
             torch.float16 if self.options.fp16 else torch.float32
@@ -703,8 +678,6 @@ class DecodingTask:
         return audio_features
 
     def _detect_language(self, audio_features, tokens):
-        print("_det", audio_features, self.options.language)
-        # print("det lang", self.options.language)
         languages = [self.options.language] * audio_features.shape[0]
         lang_probs = None
 
@@ -713,22 +686,17 @@ class DecodingTask:
                 audio_features, self.tokenizer
             )
             languages = [max(probs, key=probs.get) for probs in lang_probs]
-            # print("det lang", languages, lang_probs)
             # langs = []
             # for k, v in lang_probs[0].items():
             # langs.append((k, v))
             # langs.sort(key=lambda x: x[0])
             # for k, v in langs:
-            # print("lang", k, v)
             if self.options.language is None:
-                # print("_det opt none", self.sot_index, lang_tokens)
                 tokens[:, self.sot_index + 1] = lang_tokens  # write language tokens
-                # print("_det", tokens)
 
         return languages, lang_probs
 
     def _main_loop(self, audio_features: Tensor, tokens: Tensor):
-        print("main", tokens)
         assert audio_features.shape[0] == tokens.shape[0]
         n_batch = tokens.shape[0]
         sum_logprobs: Tensor = torch.zeros(n_batch, device=audio_features.device)
@@ -736,38 +704,28 @@ class DecodingTask:
 
         try:
             for i in range(self.sample_len):
-                # print("main loop", i, tokens.shape, tokens)
                 # if tokens.shape[1] > 1:
                 if i == 0:
                     logits = [
                         self.inference.logits(tokens[:, j : j + 1], audio_features)
                         for j in range(tokens.shape[1])
                     ]
-                    print("dump", logits[0].shape)
                     logits = torch.cat(logits, dim=1)
                 else:
-                    print("dump else", tokens)
                     logits = self.inference.logits(tokens, audio_features)
-                # print("main logits", logits.shape, logits[:, :, 50364:])
-                print("main logits", logits.shape, logits)
 
                 if (
                     i == 0 and self.tokenizer.no_speech is not None
                 ):  # save no_speech_probs
-                    print("sot index", self.sot_index)
                     probs_at_sot = logits[:, self.sot_index].float().softmax(dim=-1)
                     no_speech_probs = probs_at_sot[:, self.tokenizer.no_speech].tolist()
-                # print("main logits2", logits.shape, logits[:, 50363:])
 
                 # now we need to consider the logits at the last token only
                 logits = logits[:, -1]
-                print("main logits3", logits.shape, logits[:, 50363:])
 
                 # apply the logit filters, e.g. for suppressing or applying penalty to
                 for logit_filter in self.logit_filters:
                     logit_filter.apply(logits, tokens)
-                print("filter logits", logits[:, 50363:])
-                # print("filter logits", logits)
 
                 # expand the tokens tensor with the selected next tokens
                 tokens, completed = self.decoder.update(tokens, logits, sum_logprobs)
@@ -783,20 +741,15 @@ class DecodingTask:
 
     @torch.no_grad()
     def run(self, mel) -> List[DecodingResult]:
-        print("run", mel)
         self.decoder.reset()
         tokenizer: Tokenizer = self.tokenizer
         n_audio: int = mel.shape[0]
 
         audio_features = self._get_audio_features(mel)  # encoder forward pass
-        # print("pre run", self.initial_tokens, n_audio)
         tokens = torch.tensor([self.initial_tokens]).repeat(n_audio, 1)
-        print("run token", tokens, self.initial_tokens, n_audio)
-        # print("post run", tokens.shape)
 
         # detect language if requested, overwriting the language token
         languages, language_probs = self._detect_language(audio_features, tokens)
-        print("run lang", languages)
         if self.options.task == "lang_id":
             return [
                 DecodingResult(
@@ -809,13 +762,10 @@ class DecodingTask:
 
         # repeat the audio & text tensors by the group size, for beam search or best-of-n sampling
         audio_features = audio_features.repeat_interleave(self.n_group, dim=0)
-        print("pre interleave", tokens.shape)
         tokens = tokens.repeat_interleave(self.n_group, dim=0).to(audio_features.device)
-        print("post interleave", tokens.shape)
         # exit()
 
         # call the main sampling loop
-        # print("main", tokens.shape)
         tokens, sum_logprobs, no_speech_probs = self._main_loop(audio_features, tokens)
 
         # reshape the tensors to have (n_audio, n_group) as the first two dimensions
@@ -828,7 +778,6 @@ class DecodingTask:
 
         # get the final candidates for each group, and slice between the first sampled token and EOT
         tokens, sum_logprobs = self.decoder.finalize(tokens, sum_logprobs)
-        print("debug", tokens, tokenizer.eot)
         tokens: List[List[Tensor]] = [
             [t[self.sample_begin : (t == tokenizer.eot).nonzero()[0, 0]] for t in s]
             for s in tokens
@@ -837,7 +786,6 @@ class DecodingTask:
         # select the top-ranked sample in each group
         selected = self.sequence_ranker.rank(tokens, sum_logprobs)
         tokens: List[List[int]] = [t[i].tolist() for i, t in zip(selected, tokens)]
-        print("selected", tokens)
         texts: List[str] = [tokenizer.decode(t).strip() for t in tokens]
 
         sum_logprobs: List[float] = [lp[i] for i, lp in zip(selected, sum_logprobs)]

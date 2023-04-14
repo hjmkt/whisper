@@ -104,6 +104,7 @@ def load_model(
     device: Optional[Union[str, torch.device]] = None,
     download_root: str = None,
     in_memory: bool = False,
+    chunk_length=None,
 ) -> Whisper:
     """
     Load a Whisper ASR model
@@ -150,6 +151,8 @@ def load_model(
     del checkpoint_file
 
     dims = ModelDimensions(**checkpoint["dims"])
+    if chunk_length is not None:
+        dims.n_audio_ctx = chunk_length * 50
     model = Whisper(dims)
     model.load_state_dict(checkpoint["model_state_dict"])
 

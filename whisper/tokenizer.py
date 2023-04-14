@@ -140,7 +140,6 @@ class Tokenizer:
     def __post_init__(self):
         for special in self.encoding.special_tokens_set:
             special_token = self.encoding.encode_single_token(special)
-            # print(special, special_token)
             self.special_tokens[special] = special_token
         # with open("special_tokens.js", "w") as f:
         # print(
@@ -178,7 +177,6 @@ class Tokenizer:
 
     @cached_property
     def eot(self) -> int:
-        print("eot", self.encoding.eot_token)
         return self.encoding.eot_token
 
     @cached_property
